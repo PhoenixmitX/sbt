@@ -37,7 +37,7 @@ import sbt.librarymanagement.{
 import sbt.util.Logger
 import scala.jdk.CollectionConverters.*
 import scala.jdk.OptionConverters.*
-import scala.util.Random
+import scala.util.{ Random, Using }
 import xsbti.{ HashedVirtualFileRef, ScalaProvider }
 import xsbti.compile.{ CompileAnalysis, Inputs, PreviousResult }
 
@@ -668,6 +668,61 @@ object Compiler:
     options.map(_.split(":").map(_.split(",").map(convertValue).mkString(",")).mkString(":"))
 
   /**
+   * Removes restored outputs whose cache blob is gone, so that Zinc neither trusts nor writes
+   * through them.
+   *
+   * An action-cache hit materializes the analysis, the class files and the early output as
+   * symlinks into the CAS. When the CAS is emptied afterwards (`cleanFull` in another build
+   * sharing it, a pruned CI cache mount, a new home directory) and the build output survives,
+   * every one of those links dangles. Zinc then reads no previous analysis, prunes nothing, and
+   * creates the class files of the compilation through the dangling links, recreating CAS blobs
+   * under their outdated names; with pipelining it fails right away resolving the early jar
+   * (sbt/sbt#9849).
+   *
+   * A dangling link in the class directory is deleted, which Zinc sees as a missing product and
+   * recompiles the source. When the analysis itself dangles, its description of the restored
+   * products is lost, so every link in the class directory goes: the compilation starts from
+   * scratch and writes fresh files, and the products of sources that no longer exist do not
+   * survive into the jar. A dangling early jar or early analysis is deleted so `prepareEarlyOutput`
+   * and Zinc write new ones. Regular files are never touched: they were written by this build.
+   * The links are restored products of this compile or of the Java compile sharing the
+   * directory; anything else declared under the class directory is re-created by its own task.
+   */
+  private[sbt] def dropDanglingOutputs(
+      classesDir: Path,
+      analysisFile: Path,
+      earlyJar: Option[Path],
+      earlyAnalysisFile: Option[Path],
+      log: Logger,
+  ): Unit =
+    val analysisDangles = dangles(analysisFile)
+    if analysisDangles then
+      log.debug(s"analysis $analysisFile is a dangling link, dropping the restored class files")
+      Files.deleteIfExists(analysisFile)
+    dropClassDirLinks(classesDir, onlyDangling = !analysisDangles, log)
+    (earlyJar.toList ++ earlyAnalysisFile).filter(dangles).foreach { p =>
+      log.debug(s"early output $p is a dangling link, deleting it")
+      Files.deleteIfExists(p)
+    }
+
+  private def dangles(p: Path): Boolean = Files.isSymbolicLink(p) && !Files.exists(p)
+
+  /**
+   * Deletes the links in the class directory, all of them or only the dangling ones. The links are
+   * restored products; the CAS blobs behind them are read-only, so a compile that does not move
+   * them aside first cannot write through them either.
+   */
+  private def dropClassDirLinks(classesDir: Path, onlyDangling: Boolean, log: Logger): Unit =
+    if Files.isDirectory(classesDir) then
+      val drop: Path => Boolean = if onlyDangling then dangles else Files.isSymbolicLink(_)
+      // the walk starts with the directory itself, which may be a link of the user's making
+      val links = Using.resource(Files.walk(classesDir)): paths =>
+        paths.iterator.asScala.filter(p => p != classesDir && drop(p)).toList
+      links.foreach(Files.deleteIfExists)
+      if links.nonEmpty then
+        log.debug(s"dropped ${links.size} restored class files under $classesDir")
+
+  /**
    * Gets the early output into a state Zinc can update incrementally.
    *
    * An action-cache hit restores the early jar as a symlink into the CAS. Zinc rewrites the jar in
@@ -688,14 +743,27 @@ object Compiler:
     else if Files.exists(earlyJar) && !Files.isWritable(earlyJar) then
       earlyJar.toFile.setWritable(true)
       ci
-    else if !Files.exists(earlyJar) && hasCompilations(ci.previousResult.analysis.toScala) then
+    else if !Files.exists(earlyJar) && writesEarlyOutput(ci) &&
+      hasSources(ci.previousResult.analysis.toScala)
+    then
       log.debug(s"early output $earlyJar is missing, recompiling from scratch")
+      // Without a previous analysis Zinc moves no product aside, and scalac cannot write through
+      // a restored link into the read-only CAS.
+      dropClassDirLinks(ci.options.classesDirectory, onlyDangling = false, log)
       ci.withPreviousResult(PreviousResult.of(Optional.empty(), Optional.empty()))
     else ci
 
-  private def hasCompilations(analysis: Option[CompileAnalysis]): Boolean =
+  /** Scala 3 before 3.5.0 gets an early output path but no `-Ypickle-write`, so no jar ever. */
+  private def writesEarlyOutput(ci: Inputs): Boolean =
+    ci.options.scalacOptions.contains("-Ypickle-write")
+
+  /**
+   * Whether a previous compile exists. The stored analysis carries no compilations and the cached
+   * analysis store strips them anyway, so the sources it knows are the tell.
+   */
+  private def hasSources(analysis: Option[CompileAnalysis]): Boolean =
     analysis match
-      case Some(a: Analysis) => a.compilations.allCompilations.nonEmpty
+      case Some(a: Analysis) => a.relations.allSources.nonEmpty
       case _                 => false
 
 end Compiler
